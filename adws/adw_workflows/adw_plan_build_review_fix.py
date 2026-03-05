@@ -93,6 +93,47 @@ STEP_REVIEW = "review"
 STEP_FIX = "fix"
 TOTAL_STEPS = 4
 
+# Orchestrator project root (where .claude/commands/ lives)
+ORCHESTRATOR_ROOT = Path(__file__).parent.parent.parent
+
+
+# =============================================================================
+# COMMAND LOADER - Reads .claude/commands/ and inlines as prompts
+# =============================================================================
+
+
+def load_command(command_name: str, variables: dict[str, str] | None = None) -> str:
+    """Read a .claude/commands/<name>.md file and substitute variables.
+
+    This inlines the command content as the prompt instead of relying on
+    slash command discovery (which only works when cwd is the orchestrator).
+    This allows agents to work in external repos while using orchestrator commands.
+
+    Args:
+        command_name: Command filename (e.g., "plan.md", "build.md")
+        variables: Dict mapping variable placeholders to values.
+                   e.g., {"$1": "the prompt", "$ARGUMENTS": "/path/to/plan"}
+    Returns:
+        The command content with variables substituted.
+    """
+    command_path = ORCHESTRATOR_ROOT / ".claude" / "commands" / command_name
+    if not command_path.exists():
+        raise FileNotFoundError(f"Command file not found: {command_path}")
+
+    content = command_path.read_text()
+
+    # Strip YAML frontmatter (between --- markers)
+    if content.startswith("---"):
+        end_idx = content.index("---", 3)
+        content = content[end_idx + 3:].lstrip("\n")
+
+    # Substitute variables
+    if variables:
+        for key, value in variables.items():
+            content = content.replace(key, value)
+
+    return content
+
 
 # =============================================================================
 # HOOK FACTORY - Creates hooks that log to DB
@@ -461,13 +502,14 @@ async def run_plan_step(
             adw_id=adw_id,
             adw_step=STEP_PLAN,
             level="INFO",
-            message=f"Executing /plan command with model {model}",
+            message=f"Executing plan command with model {model}",
             metadata={"prompt_preview": prompt[:100], "working_dir": working_dir},
         )
 
         # Build the agent query
+        plan_command = load_command("plan.md", {"$1": prompt})
         query_input = QueryInput(
-            prompt=f"/plan {prompt}",
+            prompt=plan_command,
             options=QueryOptions(
                 model=model,
                 cwd=working_dir,
@@ -564,7 +606,7 @@ IMPORTANT: Respond with ONLY the absolute file path to the plan file you created
 - Just the raw file path on a single line
 
 Example correct response:
-/Users/user/project/specs/feature-plan.md
+/Users/user/project/.ai/specs/feature-plan.md
 
 What is the absolute path to the plan file you created?"""
 
@@ -676,13 +718,14 @@ async def run_build_step(
             adw_id=adw_id,
             adw_step=STEP_BUILD,
             level="INFO",
-            message=f"Executing /build command with plan: {plan_path}",
+            message=f"Executing build command with plan: {plan_path}",
             metadata={"plan_path": plan_path, "working_dir": working_dir},
         )
 
         # Build the agent query
+        build_command = load_command("build.md", {"$ARGUMENTS": plan_path})
         query_input = QueryInput(
-            prompt=f"/build {plan_path}",
+            prompt=build_command,
             options=QueryOptions(
                 model=model,
                 cwd=working_dir,
@@ -834,7 +877,7 @@ async def run_review_step(
             adw_id=adw_id,
             adw_step=STEP_REVIEW,
             level="INFO",
-            message=f"Executing /review command with model {model}",
+            message=f"Executing review command with model {model}",
             metadata={
                 "user_prompt_preview": user_prompt[:100],
                 "plan_path": plan_path,
@@ -842,12 +885,8 @@ async def run_review_step(
             },
         )
 
-        # Build the review command
-        # Escape quotes in user_prompt to prevent command injection
-        escaped_prompt = user_prompt.replace('"', '\\"')
-        review_command = f'/review "{escaped_prompt}" {plan_path}'
-
         # Build the agent query
+        review_command = load_command("review.md", {"$1": user_prompt, "$2": plan_path})
         query_input = QueryInput(
             prompt=review_command,
             options=QueryOptions(
@@ -932,7 +971,7 @@ async def run_review_step(
 
 
 async def extract_review_path(working_dir: str) -> str | None:
-    """Find the most recently created review file in app_review/.
+    """Find the most recently created review file in .ai/reviews/.
 
     Args:
         working_dir: Working directory
@@ -942,9 +981,9 @@ async def extract_review_path(working_dir: str) -> str | None:
     """
     console.print("[cyan]Finding review report path...[/cyan]")
 
-    review_dir = Path(working_dir) / "app_review"
+    review_dir = Path(working_dir) / ".ai" / "reviews"
     if not review_dir.exists():
-        console.print("[yellow]No app_review directory found[/yellow]")
+        console.print("[yellow]No .ai/reviews directory found[/yellow]")
         return None
 
     # Find the most recent review file
@@ -959,7 +998,7 @@ async def extract_review_path(working_dir: str) -> str | None:
         console.print(f"[green]Found review file: {review_path}[/green]")
         return review_path
 
-    console.print("[yellow]No review files found in app_review/[/yellow]")
+    console.print("[yellow]No review files found in .ai/reviews/[/yellow]")
     return None
 
 
@@ -1047,7 +1086,7 @@ async def run_fix_step(
             adw_id=adw_id,
             adw_step=STEP_FIX,
             level="INFO",
-            message=f"Executing /fix command with model {model}",
+            message=f"Executing fix command with model {model}",
             metadata={
                 "user_prompt_preview": user_prompt[:100],
                 "plan_path": plan_path,
@@ -1056,12 +1095,8 @@ async def run_fix_step(
             },
         )
 
-        # Build the fix command
-        # Escape quotes in user_prompt to prevent command injection
-        escaped_prompt = user_prompt.replace('"', '\\"')
-        fix_command = f'/fix "{escaped_prompt}" {plan_path} {review_path}'
-
         # Build the agent query
+        fix_command = load_command("fix.md", {"$1": user_prompt, "$2": plan_path, "$3": review_path})
         query_input = QueryInput(
             prompt=fix_command,
             options=QueryOptions(
@@ -1253,9 +1288,9 @@ async def run_workflow(adw_id: str) -> bool:
         )
 
         if not plan_path:
-            # Try a fallback - look for recently created .md files in specs/
+            # Try a fallback - look for recently created .md files in .ai/specs/
             console.print("[yellow]Attempting fallback plan path detection...[/yellow]")
-            specs_dir = Path(working_dir) / "specs"
+            specs_dir = Path(working_dir) / ".ai" / "specs"
             if specs_dir.exists():
                 md_files = sorted(specs_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
                 if md_files:

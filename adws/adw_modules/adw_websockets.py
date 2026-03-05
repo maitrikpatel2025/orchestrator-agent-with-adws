@@ -39,7 +39,6 @@ from dotenv import load_dotenv
 # Load environment variables
 _env_paths = [
     Path(__file__).parent.parent.parent / ".env",  # Root .env
-    Path(__file__).parent.parent.parent / "apps" / "orchestrator_3_stream" / ".env",
 ]
 for env_path in _env_paths:
     if env_path.exists():

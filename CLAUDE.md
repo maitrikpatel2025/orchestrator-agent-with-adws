@@ -6,16 +6,9 @@
 - Use real Claude Agent SDK agents
 - IMPORTANT: The trick with database connection is to make sure your tests are ephemeral, it should start and end the database in the exact same state. Create the test data you need for the test, then clean it up after the test.
 
-## Keep models.py in sync with the migrations
-
-Be sure we keep our apps/orchestrator_db/models.py in sync with the migrations in apps/orchestrator_db/migrations/*.py.
-
-If we request a change to a migration file be absolutely sure to update the models.py file to reflect the changes.
-
 ## Use .env file when needed and expose with python-dotenv
 
 - Use python-dotenv to load environment variables from .env file
-- Copy the root level .env into the respective apps/*/.env if you need it locally
 
 ## IMPORTANT: Actually read the file
 
@@ -41,4 +34,13 @@ If we request a change to a migration file be absolutely sure to update the mode
 ## Avoid dict and prefer pydantic models
 
 - Prefer pydantic models over dicts.
-- For every database model use your `orchestrator_agents_db.py` file to parse and manage the data. If you don't have one, update the `apps/orchestrator_db/sync_models.py` file to sync the `apps/orchestrator_db/models.py` into your app directory where ever you need it.
+
+## IMPORTANT: Never silently fail, always raise an error and log it.
+
+- Never create a try/except block that skips over errors.
+- If you try catch an error, always log it and raise it again.
+
+## Per-repo AI artifacts
+
+- All specs, reviews, and fix reports go into the target repo's `.ai/` directory
+- Structure: `.ai/specs/`, `.ai/reviews/`, `.ai/fix-reports/`

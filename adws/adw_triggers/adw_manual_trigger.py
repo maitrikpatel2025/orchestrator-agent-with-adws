@@ -89,18 +89,32 @@ async def create_adw_record(
     }
 
     # Add review_model for review workflows
-    if workflow_type in ("plan_build_review", "plan_build_review_fix"):
+    if workflow_type in ("plan_build_review", "plan_build_review_fix", "review", "sdlc"):
         input_data["review_model"] = "claude-opus-4-5-20251101"
 
     # Add fix_model for fix workflows
     if workflow_type == "plan_build_review_fix":
         input_data["fix_model"] = "claude-opus-4-5-20251101"
 
+    # Add test_model for test workflows
+    if workflow_type in ("test", "sdlc"):
+        input_data["test_model"] = model
+
+    # Add docs_model for docs workflows
+    if workflow_type in ("document", "sdlc"):
+        input_data["docs_model"] = model
+
     # Determine total_steps based on workflow type
     workflow_steps = {
+        "plan": 1,
+        "build": 1,
+        "test": 1,
+        "review": 1,
+        "document": 1,
         "plan_build": 2,
         "plan_build_review": 3,
         "plan_build_review_fix": 4,
+        "sdlc": 5,
     }
     total_steps = workflow_steps.get(workflow_type, 2)
 

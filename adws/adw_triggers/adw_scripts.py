@@ -43,10 +43,15 @@ async def run_adw_workflow_async(
     cmd = ["uv", "run", str(workflow_path), "--adw-id", adw_id]
 
     try:
+        # Build env without CLAUDECODE to allow nested Claude CLI sessions
+        import os
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
         # Run from project root for proper imports and .env access
         process = subprocess.Popen(
             cmd,
             cwd=str(project_root),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

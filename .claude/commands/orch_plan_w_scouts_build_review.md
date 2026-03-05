@@ -39,7 +39,7 @@ REVIEW_AGENT_NAME: (will be generated based on task)
     - Design a detailed implementation plan
     - Identify all files that need to be created or modified
     - Specify the technical approach and architecture decisions
-    - Create a structured plan document in the `specs/` directory
+    - Create a structured plan document in the `.ai/specs/` directory
     - The planner should be configured with tools: Read, Glob, Grep, Write, Bash
 - **(Create Build Agent)** Run `create_agent` to create a build agent using the `build-agent` subagent_template
   - Name the agent something descriptive like "builder-{task-keyword}"
@@ -60,7 +60,7 @@ REVIEW_AGENT_NAME: (will be generated based on task)
   - Continue checking until you see a `response` event_category followed by a `hook` with a `Stop` event_type
 - **(Report Planner)** Once the planner has completed, retrieve and analyze their plan from the agent logs.
   - Extract key information: plan location, files to modify, implementation approach
-  - Read the plan file from `specs/` directory to understand the full context
+  - Read the plan file from `.ai/specs/` directory to understand the full context
   - Communicate the planner's findings to the user
 
 ### Phase 2: Build (Implementation)

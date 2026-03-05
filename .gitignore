@@ -165,13 +165,8 @@ logs/
 
 agents/
 !.claude/agents
-!apps/orchestrator_3_stream/.claude/agents/
-
 
 .claude/data
-
-data/
-!apps/nile/server/data/nile.db
 
 videos/
 

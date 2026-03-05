@@ -31,6 +31,42 @@ workflow_types:
     flow: "/plan -> /build -> /review -> /fix"
     use_case: "Full automation - automatically fixes issues found in review"
 
+  plan:
+    steps: 1
+    file: "adws/adw_workflows/adw_plan.py"
+    flow: "/plan"
+    use_case: "Standalone plan with worktree isolation and auto-PR"
+
+  build:
+    steps: 1
+    file: "adws/adw_workflows/adw_build.py"
+    flow: "/build"
+    use_case: "Standalone build with worktree isolation and auto-PR"
+
+  test:
+    steps: 1
+    file: "adws/adw_workflows/adw_test.py"
+    flow: "/test"
+    use_case: "Standalone test with worktree isolation and auto-PR"
+
+  review:
+    steps: 1
+    file: "adws/adw_workflows/adw_review.py"
+    flow: "/review"
+    use_case: "Standalone review with worktree isolation and auto-PR"
+
+  document:
+    steps: 1
+    file: "adws/adw_workflows/adw_document.py"
+    flow: "/docs"
+    use_case: "Standalone docs with worktree isolation and auto-PR"
+
+  sdlc:
+    steps: 5
+    file: "adws/adw_workflows/adw_sdlc.py"
+    flow: "/plan -> /build -> /test -> /review -> /docs"
+    use_case: "Full SDLC with worktree isolation - all 5 steps, auto-PR at end"
+
 composability:
   principle: "Each step is deterministic in structure, non-deterministic in execution"
   steps:
@@ -50,6 +86,14 @@ composability:
       deterministic: "Only runs if review verdict is FAIL"
       non_deterministic: "Agent resolves issues based on review findings"
       slash_command: "/fix"
+    test:
+      deterministic: "Always outputs test report with PASS/FAIL verdict at .ai/test-reports/"
+      non_deterministic: "Agent writes and executes e2e tests based on built application"
+      slash_command: "/test"
+    docs:
+      deterministic: "Always outputs docs at .ai/docs/ and updates README.md"
+      non_deterministic: "Agent generates comprehensive documentation based on codebase analysis"
+      slash_command: "/docs"
 
   create_custom_workflow: |
     1. Copy existing workflow file (e.g., adw_plan_build.py)
@@ -120,12 +164,16 @@ core_implementation:
       STEP_BUILD: "build"
       STEP_REVIEW: "review"
       STEP_FIX: "fix"
+      STEP_TEST: "test"
+      STEP_DOCS: "docs"
 
     key_functions:
       run_plan_step: "Execute /plan command, return spec path"
       run_build_step: "Execute /build command with spec path"
       run_review_step: "Execute /review command, extract verdict"
       run_fix_step: "Execute /fix command if verdict is FAIL"
+      run_test_step: "Execute /test command, write and run tests, extract PASS/FAIL verdict"
+      run_docs_step: "Execute /docs command, generate documentation"
 
   adw_triggers:
     adw_scripts:
@@ -139,130 +187,6 @@ core_implementation:
       file: "adws/adw_triggers/adw_manual_trigger.py"
       purpose: "CLI trigger for testing workflows"
       usage: "uv run adws/adw_triggers/adw_manual_trigger.py <name> <workflow_type> <prompt> [working_dir]"
-
-orchestrator_integration:
-  start_adw_tool:
-    file: "apps/orchestrator_3_stream/backend/modules/agent_manager.py"
-    lines: "638-742"
-    signature: "start_adw(name_of_adw: str, workflow_type: str, prompt: str, description?: str)"
-    flow:
-      - "Validate required fields (name_of_adw, workflow_type, prompt)"
-      - "Validate workflow file exists at adws/adw_workflows/adw_{workflow_type}.py"
-      - "Create ADW record via create_adw() database function"
-      - "Broadcast adw_started WebSocket event"
-      - "Call run_adw() to spawn background process"
-      - "Return adw_id for tracking"
-
-  check_adw_tool:
-    file: "apps/orchestrator_3_stream/backend/modules/agent_manager.py"
-    lines: "744-851"
-    signature: "check_adw(adw_id: str, tail_count?: int, event_type?: str, include_step_details?: bool)"
-    purpose: "Check ADW status and recent activity"
-
-  database_functions:
-    file: "apps/orchestrator_3_stream/backend/modules/database.py"
-    functions:
-      create_adw:
-        lines: "1608-1660"
-        purpose: "Create new ADW record"
-        stores: "prompt, working_dir in input_data JSONB"
-      get_adw:
-        lines: "1662-1696"
-        purpose: "Fetch ADW by ID"
-      update_adw_status:
-        lines: "1698-1761"
-        purpose: "Update status, current_step, completed_steps"
-      get_adw_logs:
-        lines: "1763-1825"
-        purpose: "Fetch agent_logs for ADW swimlane"
-      get_adw_system_logs:
-        lines: "1827-1890"
-        purpose: "Fetch system_logs for ADW"
-
-websocket_events:
-  adw_created:
-    source: "websocket_manager.py:232-234"
-    fields: ["type", "adw"]
-    trigger: "When new ADW record created"
-
-  adw_updated:
-    source: "websocket_manager.py:236-240"
-    fields: ["type", "adw_id", "adw"]
-    trigger: "Status change, step progress"
-
-  adw_event:
-    source: "websocket_manager.py:242-246"
-    fields: ["type", "adw_id", "event"]
-    trigger: "Agent event for swimlane square"
-
-  adw_step_change:
-    source: "websocket_manager.py:248-261"
-    fields: ["type", "adw_id", "step", "event_type", "payload", "timestamp"]
-    trigger: "StepStart/StepEnd events"
-
-  adw_event_summary_update:
-    source: "websocket_manager.py:263-274"
-    fields: ["type", "adw_id", "event_id", "summary"]
-    trigger: "AI summary generated for event"
-
-frontend_integration:
-  swimlane_component:
-    file: "apps/orchestrator_3_stream/frontend/src/components/AdwSwimlanes.vue"
-    lines: 1024
-    purpose: "Main ADW visualization component"
-    features:
-      - "ADW list with status (pending/in_progress/completed/failed)"
-      - "Step lanes with unique colors per step"
-      - "Event squares with icons by type"
-      - "Event detail panel with AI summaries"
-      - "Filter controls (response, tool, thinking, hook, system)"
-      - "Real-time WebSocket updates"
-
-    event_icons:
-      TextBlock: "response (green)"
-      ToolUseBlock: "tool (orange)"
-      ThinkingBlock: "thinking (purple)"
-      PreToolUse: "hook (cyan)"
-      PostToolUse: "hook (cyan)"
-      StepStart: "start (cyan)"
-      StepEnd: "end (green)"
-      Stop: "stop (red)"
-
-  adw_service:
-    file: "apps/orchestrator_3_stream/frontend/src/services/adwService.ts"
-    key_functions:
-      getAdws: "Fetch all ADWs"
-      getAdwEvents: "Fetch events for swimlane (limit: 2000)"
-      getAdwSummary: "Fetch ADW with step breakdown"
-
-  store_integration:
-    file: "apps/orchestrator_3_stream/frontend/src/stores/orchestratorStore.ts"
-    state:
-      adws: "ref<AiDeveloperWorkflow[]>"
-      adwEvents: "ref<AdwEvent[]>"
-      allAdwEventsByStep: "computed - events grouped by ADW and step"
-    actions:
-      fetchAdws: "Load all ADWs"
-      fetchAdwEvents: "Load events for specific ADW"
-      fetchAllAdwEvents: "Load events for all ADWs"
-    websocket_handlers:
-      onAdwCreated: "Add new ADW to list"
-      onAdwUpdated: "Update ADW in list"
-      onAdwEvent: "Add event to swimlane"
-      onAdwEventSummaryUpdate: "Update event summary"
-
-  types:
-    file: "apps/orchestrator_3_stream/frontend/src/types.d.ts"
-    interfaces:
-      AiDeveloperWorkflow:
-        lines: "405-426"
-        fields: ["id", "orchestrator_agent_id", "adw_name", "workflow_type", "status", "current_step", "total_steps", "completed_steps", "started_at", "completed_at", "duration_seconds", "input_data", "output_data", "error_message"]
-      AdwEvent:
-        lines: "429-439"
-        fields: ["id", "agent_id", "adw_id", "adw_step", "event_category", "event_type", "summary", "payload", "timestamp"]
-      AdwStepSummary:
-        lines: "442-448"
-        fields: ["step", "event_count", "event_types", "agent_id", "started_at", "ended_at"]
 
 slash_commands:
   plan:
@@ -278,14 +202,27 @@ slash_commands:
   review:
     file: ".claude/commands/review.md"
     purpose: "Risk-tiered code review"
-    output: "app_review/review_<timestamp>.md"
+    output: ".ai/reviews/review_<timestamp>.md"
     verdict: "PASS or FAIL"
 
   fix:
     file: ".claude/commands/fix.md"
     purpose: "Fix issues from review"
     input: "User prompt, plan path, review path"
-    output: "app_fix_reports/fix_<timestamp>.md"
+    output: ".ai/fix-reports/fix_<timestamp>.md"
+
+  test:
+    file: ".claude/commands/test.md"
+    purpose: "Write and execute e2e tests"
+    input: "User prompt, plan path"
+    output: ".ai/test-reports/test_<timestamp>.md"
+    verdict: "PASS or FAIL"
+
+  docs:
+    file: ".claude/commands/docs.md"
+    purpose: "Generate comprehensive documentation"
+    input: "User prompt, plan path"
+    output: "README.md, .ai/docs/architecture.md, .ai/docs/api.md"
 
 database_schema:
   ai_developer_workflows:
@@ -365,30 +302,27 @@ key_file_locations:
     adw_database: "adws/adw_modules/adw_database.py"
 
   workflows:
+    plan: "adws/adw_workflows/adw_plan.py"
+    build: "adws/adw_workflows/adw_build.py"
+    test: "adws/adw_workflows/adw_test.py"
+    review: "adws/adw_workflows/adw_review.py"
+    document: "adws/adw_workflows/adw_document.py"
     plan_build: "adws/adw_workflows/adw_plan_build.py"
     plan_build_review: "adws/adw_workflows/adw_plan_build_review.py"
     plan_build_review_fix: "adws/adw_workflows/adw_plan_build_review_fix.py"
+    sdlc: "adws/adw_workflows/adw_sdlc.py"
 
   triggers:
     scripts: "adws/adw_triggers/adw_scripts.py"
     manual: "adws/adw_triggers/adw_manual_trigger.py"
-
-  orchestrator:
-    agent_manager: "apps/orchestrator_3_stream/backend/modules/agent_manager.py (start_adw: 638-742)"
-    database: "apps/orchestrator_3_stream/backend/modules/database.py (ADW functions: 1608-1890)"
-    websocket_manager: "apps/orchestrator_3_stream/backend/modules/websocket_manager.py (ADW broadcasts: 232-274)"
-
-  frontend:
-    swimlanes: "apps/orchestrator_3_stream/frontend/src/components/AdwSwimlanes.vue"
-    service: "apps/orchestrator_3_stream/frontend/src/services/adwService.ts"
-    store: "apps/orchestrator_3_stream/frontend/src/stores/orchestratorStore.ts"
-    types: "apps/orchestrator_3_stream/frontend/src/types.d.ts (ADW types: 405-452)"
 
   slash_commands:
     plan: ".claude/commands/plan.md"
     build: ".claude/commands/build.md"
     review: ".claude/commands/review.md"
     fix: ".claude/commands/fix.md"
+    test: ".claude/commands/test.md"
+    docs: ".claude/commands/docs.md"
 
 architecture_summary: |
   AI Developer Workflows represent the fusion of deterministic software engineering
@@ -402,6 +336,5 @@ architecture_summary: |
   novel problems). The pattern is infinitely composable - create new workflows
   by mixing and matching step types.
 
-  Real-time visibility comes from the swimlane UI, where each ADW displays as
-  a card with step lanes and event squares. Every tool call, thinking block,
-  and response is visualized with AI-generated summaries on hover.
+  ADWs are triggered via CLI (adw_manual_trigger.py) and log all events
+  to PostgreSQL for traceability.

@@ -16,7 +16,7 @@ You are a specialized code fix agent. Your job is to read a code review report, 
 USER_PROMPT: $1
 PLAN_PATH: $2
 REVIEW_PATH: $3
-FIX_OUTPUT_DIRECTORY: `app_fix_reports/`
+FIX_OUTPUT_DIRECTORY: `.ai/fix-reports/`
 
 ## Instructions
 
@@ -28,6 +28,7 @@ FIX_OUTPUT_DIRECTORY: `app_fix_reports/`
 - For each issue, implement the recommended solution (prefer the first/primary solution).
 - After fixing each issue, verify the fix works as expected.
 - Run validation commands from the original plan to ensure nothing is broken.
+- Ensure the `.ai/fix-reports/` directory exists in the current working directory (create it if it doesn't).
 - Create a fix report documenting what was changed and how each issue was resolved.
 - If a recommended solution doesn't work, try alternative solutions or document why it couldn't be fixed.
 - Be thorough but efficient—fix issues correctly the first time.

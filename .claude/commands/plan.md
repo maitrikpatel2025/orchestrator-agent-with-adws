@@ -1,5 +1,5 @@
 ---
-description: Creates a concise engineering implementation plan based on user requirements and saves it to specs directory
+description: Creates a concise engineering implementation plan based on user requirements and saves it to the target repo's .ai/specs/ directory
 argument-hint: [user prompt]
 ---
 
@@ -10,7 +10,7 @@ Create a detailed implementation plan based on the user's requirements provided 
 ## Variables
 
 USER_PROMPT: $1
-PLAN_OUTPUT_DIRECTORY: `specs/`
+PLAN_OUTPUT_DIRECTORY: `.ai/specs/`
 
 ## Instructions
 
@@ -22,6 +22,7 @@ PLAN_OUTPUT_DIRECTORY: `specs/`
 - Follow the Plan Format below to create a comprehensive implementation plan
 - Include all required sections and conditional sections based on task type and complexity
 - Generate a descriptive, kebab-case filename based on the main topic of the plan
+- Ensure the `.ai/specs/` directory exists in the current working directory (create it if it doesn't)
 - Save the complete implementation plan to `PLAN_OUTPUT_DIRECTORY/<descriptive-name>.md`
 - Ensure the plan is detailed enough that another developer could follow it to implement the solution
 - Include code examples or pseudo-code where appropriate to clarify complex concepts

@@ -187,6 +187,4 @@ Validation Results:
 Codebase References:
 - adws/adw_workflows/adw_plan_build.py (validated)
 - adws/adw_modules/adw_logging.py (validated)
-- apps/orchestrator_3_stream/backend/modules/agent_manager.py:638-742 (validated)
-- apps/orchestrator_3_stream/frontend/src/components/AdwSwimlanes.vue (validated)
 ```

@@ -1,5 +1,5 @@
 ---
-description: Creates a concise engineering implementation plan based on user requirements and saves it to specs directory
+description: Creates a concise engineering implementation plan based on user requirements and saves it to the target repo's .ai/specs/ directory
 argument-hint: [user prompt]
 ---
 
@@ -10,7 +10,7 @@ Create a detailed implementation plan based on the user's requirements provided 
 ## Variables
 
 USER_PROMPT: $1
-PLAN_OUTPUT_DIRECTORY: `specs/`
+PLAN_OUTPUT_DIRECTORY: `.ai/specs/`
 TOTAL_BASE_SCOUT_SUBAGENTS: 3
 TOTAL_FAST_SCOUT_SUBAGENTS: 5
 

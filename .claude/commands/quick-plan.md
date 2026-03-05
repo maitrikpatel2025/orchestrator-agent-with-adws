@@ -1,6 +1,6 @@
 ---
 allowed-tools: Read, Write, Edit, Glob, Grep, MultiEdit
-description: Creates a concise engineering implementation plan based on user requirements and saves it to specs directory
+description: Creates a concise engineering implementation plan based on user requirements and saves it to the target repo's .ai/specs/ directory
 argument-hint: [user prompt]
 model: claude-sonnet-4-5-20250929
 ---
@@ -12,7 +12,7 @@ Create a detailed implementation plan based on the user's requirements provided 
 ## Variables
 
 USER_PROMPT: $ARGUMENTS
-PLAN_OUTPUT_DIRECTORY: `specs/`
+PLAN_OUTPUT_DIRECTORY: `.ai/specs/`
 
 ## Instructions
 

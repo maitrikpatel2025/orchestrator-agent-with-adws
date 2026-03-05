@@ -10,24 +10,25 @@
 # ]
 # ///
 """
-ADW Plan-Build Workflow - Two-step workflow: plan then build.
+ADW Document Workflow - Standalone docs step with worktree isolation and auto-PR.
 
 This workflow:
 1. Receives --adw-id as CLI arg
-2. Fetches prompt and working_dir from DB
-3. Runs /plan <prompt> agent
-4. Extracts plan file path via quick_prompt
-5. Runs /build <path> agent
+2. Fetches prompt, plan_path, and working_dir from DB
+3. Creates a git worktree in the target repo
+4. Runs /docs <prompt> <plan_path> agent inside the worktree
+5. Pushes branch and creates PR for human review
 6. Logs all events to agent_logs for swimlane visualization
 
 Usage:
-    uv run adws/adw_workflows/adw_plan_build.py --adw-id <uuid>
+    uv run adws/adw_workflows/adw_document.py --adw-id <uuid>
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -54,11 +55,9 @@ from adw_modules.adw_summarizer import summarize_event
 from adw_modules.adw_websockets import broadcast_adw_event_summary_update
 from adw_modules.adw_agent_sdk import (
     query_to_completion,
-    quick_prompt,
     QueryInput,
     QueryOptions,
     MessageHandlers,
-    AdhocPrompt,
     HookEventName,
     HooksConfig,
     HookMatcher,
@@ -85,9 +84,8 @@ console = Console()
 # CONSTANTS
 # =============================================================================
 
-STEP_PLAN = "plan"
-STEP_BUILD = "build"
-TOTAL_STEPS = 2
+STEP_DOCS = "docs"
+TOTAL_STEPS = 1
 
 # Orchestrator project root (where .claude/commands/ lives)
 ORCHESTRATOR_ROOT = Path(__file__).parent.parent.parent
@@ -106,9 +104,9 @@ def load_command(command_name: str, variables: dict[str, str] | None = None) -> 
     This allows agents to work in external repos while using orchestrator commands.
 
     Args:
-        command_name: Command filename (e.g., "plan.md", "build.md")
+        command_name: Command filename (e.g., "plan.md", "docs.md")
         variables: Dict mapping variable placeholders to values.
-                   e.g., {"$1": "the prompt", "$ARGUMENTS": "/path/to/plan"}
+                   e.g., {"$1": "the prompt", "$2": "/path/to/plan"}
     Returns:
         The command content with variables substituted.
     """
@@ -132,6 +130,203 @@ def load_command(command_name: str, variables: dict[str, str] | None = None) -> 
 
 
 # =============================================================================
+# WORKTREE OPERATIONS - Create worktree in target repo
+# =============================================================================
+
+
+def create_worktree_in_target(
+    working_dir: str,
+    adw_id: str,
+    branch_name: str | None = None,
+) -> tuple[str, str]:
+    """Create a git worktree inside the target repo for isolated work.
+
+    Args:
+        working_dir: The target repo's working directory
+        adw_id: ADW ID (used for worktree path and default branch name)
+        branch_name: Optional branch name (defaults to adw-{adw_id[:8]})
+
+    Returns:
+        Tuple of (worktree_path, branch_name)
+
+    Raises:
+        RuntimeError: If worktree creation fails
+    """
+    if branch_name is None:
+        branch_name = f"adw-{adw_id[:8]}"
+
+    worktree_dir = Path(working_dir) / ".claude" / "worktrees" / adw_id
+    worktree_path = str(worktree_dir)
+
+    # If worktree already exists, return it
+    if worktree_dir.exists():
+        console.print(f"[yellow]Worktree already exists: {worktree_path}[/yellow]")
+        return worktree_path, branch_name
+
+    # Ensure parent directory exists
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Determine base ref: prefer origin/main, fallback to HEAD
+    base_ref = "HEAD"
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "origin/main"],
+        capture_output=True, text=True, cwd=working_dir,
+    )
+    if result.returncode == 0:
+        base_ref = "origin/main"
+
+    # Try creating worktree with new branch
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, worktree_path, base_ref],
+        capture_output=True, text=True, cwd=working_dir,
+    )
+
+    if result.returncode != 0:
+        # Branch might already exist — try without -b
+        if "already exists" in result.stderr:
+            console.print(f"[yellow]Branch {branch_name} already exists, using it[/yellow]")
+            result = subprocess.run(
+                ["git", "worktree", "add", worktree_path, branch_name],
+                capture_output=True, text=True, cwd=working_dir,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to create worktree (branch exists): {result.stderr}"
+                )
+        else:
+            raise RuntimeError(f"Failed to create worktree: {result.stderr}")
+
+    console.print(f"[green]Created worktree: {worktree_path} (branch: {branch_name})[/green]")
+    return worktree_path, branch_name
+
+
+# =============================================================================
+# GIT OPERATIONS - Push and create PR
+# =============================================================================
+
+
+async def push_and_create_pr(
+    worktree_path: str,
+    branch_name: str,
+    adw_id: str,
+    prompt: str,
+) -> str | None:
+    """Push branch and create PR at end of workflow.
+
+    Stages and commits any uncommitted changes, pushes the branch,
+    and creates a PR if one doesn't already exist.
+
+    Args:
+        worktree_path: Path to the worktree
+        branch_name: Branch name to push
+        adw_id: ADW ID for PR metadata
+        prompt: Original prompt (used in PR description)
+
+    Returns:
+        PR URL if created, or None (never fails the workflow)
+    """
+    try:
+        # Stage any uncommitted changes
+        subprocess.run(
+            ["git", "add", "-A"],
+            capture_output=True, text=True, cwd=worktree_path,
+        )
+
+        # Check if there are changes to commit
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=worktree_path,
+        )
+        if status_result.stdout.strip():
+            subprocess.run(
+                ["git", "commit", "-m", f"adw-{adw_id[:8]}: automated workflow changes"],
+                capture_output=True, text=True, cwd=worktree_path,
+            )
+
+        # Push branch
+        push_result = subprocess.run(
+            ["git", "push", "-u", "origin", branch_name],
+            capture_output=True, text=True, cwd=worktree_path,
+        )
+        if push_result.returncode != 0:
+            console.print(f"[yellow]Push failed: {push_result.stderr}[/yellow]")
+            await log_system_event(
+                adw_id=adw_id,
+                adw_step=None,
+                level="WARNING",
+                message=f"Git push failed: {push_result.stderr}",
+            )
+            return None
+
+        console.print(f"[green]Pushed branch: {branch_name}[/green]")
+
+        # Check if PR already exists
+        pr_check = subprocess.run(
+            ["gh", "pr", "list", "--head", branch_name, "--json", "url", "--limit", "1"],
+            capture_output=True, text=True, cwd=worktree_path,
+        )
+        if pr_check.returncode == 0 and pr_check.stdout.strip() not in ("", "[]"):
+            import json
+            pr_data = json.loads(pr_check.stdout)
+            if pr_data:
+                pr_url = pr_data[0]["url"]
+                console.print(f"[green]PR already exists: {pr_url}[/green]")
+                await log_system_event(
+                    adw_id=adw_id,
+                    adw_step=None,
+                    level="INFO",
+                    message=f"PR already exists: {pr_url}",
+                )
+                return pr_url
+
+        # Create PR
+        pr_title = f"adw-{adw_id[:8]}: {prompt[:60]}"
+        pr_body = (
+            f"## ADW Automated Workflow\n\n"
+            f"**ADW ID:** `{adw_id}`\n"
+            f"**Branch:** `{branch_name}`\n\n"
+            f"### Prompt\n{prompt}\n\n"
+            f"---\n"
+            f"*Created by ADW automated workflow*"
+        )
+
+        pr_result = subprocess.run(
+            ["gh", "pr", "create", "--title", pr_title, "--body", pr_body, "--base", "main"],
+            capture_output=True, text=True, cwd=worktree_path,
+        )
+
+        if pr_result.returncode == 0:
+            pr_url = pr_result.stdout.strip()
+            console.print(f"[green]Created PR: {pr_url}[/green]")
+            await log_system_event(
+                adw_id=adw_id,
+                adw_step=None,
+                level="INFO",
+                message=f"Created PR: {pr_url}",
+            )
+            return pr_url
+        else:
+            console.print(f"[yellow]PR creation failed: {pr_result.stderr}[/yellow]")
+            await log_system_event(
+                adw_id=adw_id,
+                adw_step=None,
+                level="WARNING",
+                message=f"PR creation failed: {pr_result.stderr}",
+            )
+            return None
+
+    except Exception as e:
+        console.print(f"[yellow]push_and_create_pr error: {e}[/yellow]")
+        await log_system_event(
+            adw_id=adw_id,
+            adw_step=None,
+            level="WARNING",
+            message=f"push_and_create_pr error: {e}",
+        )
+        return None
+
+
+# =============================================================================
 # HOOK FACTORY - Creates hooks that log to DB
 # =============================================================================
 
@@ -146,7 +341,7 @@ def create_logging_hooks(adw_id: str, adw_step: str, agent_id: str) -> HooksConf
 
     Args:
         adw_id: The ADW ID for logging
-        adw_step: Current step slug (e.g., "plan", "build")
+        adw_step: Current step slug (e.g., "docs")
         agent_id: The agent ID for logging
 
     Returns:
@@ -173,9 +368,6 @@ def create_logging_hooks(adw_id: str, adw_step: str, agent_id: str) -> HooksConf
             return f"Grep: {tool_input['pattern']}"
         elif tool_name == "Skill" and "skill" in tool_input:
             return f"Skill: /{tool_input['skill']}"
-        elif tool_name == "Task":
-            desc = tool_input.get("description", "")[:30]
-            return f"Task: {desc}..."
         return f"Tool: {tool_name}"
 
     async def pre_tool_use_hook(
@@ -338,7 +530,6 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
     async def on_assistant_block(block: TextBlock | ThinkingBlock | ToolUseBlock) -> None:
         """Log individual assistant message blocks with async AI summarization."""
         if isinstance(block, TextBlock):
-            # Text response from agent - keep full content
             text = block.text
             preview = text[:150] + "..." if len(text) > 150 else text
             log_id = await log_adw_event(
@@ -349,15 +540,13 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
                 content=text,
                 agent_id=agent_id,
                 payload={"text": text},
-                summary=f"Response: {preview}",  # Fallback summary
+                summary=f"Response: {preview}",
             )
-            # Spawn async AI summarization
             asyncio.create_task(_summarize_and_update(
                 log_id, adw_id, {"content": text}, "TextBlock"
             ))
 
         elif isinstance(block, ThinkingBlock):
-            # Agent thinking/reasoning - keep full content
             thinking = block.thinking
             preview = thinking[:100] + "..." if len(thinking) > 100 else thinking
             log_id = await log_adw_event(
@@ -368,15 +557,13 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
                 content=thinking,
                 agent_id=agent_id,
                 payload={"thinking": thinking},
-                summary=f"Thinking: {preview}",  # Fallback summary
+                summary=f"Thinking: {preview}",
             )
-            # Spawn async AI summarization
             asyncio.create_task(_summarize_and_update(
                 log_id, adw_id, {"thinking": thinking}, "ThinkingBlock"
             ))
 
         elif isinstance(block, ToolUseBlock):
-            # Tool call declaration (the agent declaring it wants to use a tool)
             tool_name = block.name
             tool_input = block.input
             log_id = await log_adw_event(
@@ -391,9 +578,8 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
                     "tool_input": tool_input,
                     "tool_use_id": block.id,
                 },
-                summary=f"Using tool: {tool_name}",  # Fallback summary
+                summary=f"Using tool: {tool_name}",
             )
-            # Spawn async AI summarization
             asyncio.create_task(_summarize_and_update(
                 log_id, adw_id, {"tool_name": tool_name, "tool_input": tool_input}, "ToolUseBlock"
             ))
@@ -405,7 +591,7 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
             adw_step=adw_step,
             event_category="response",
             event_type="result",
-            content=msg.result if msg.result else "",  # Full content
+            content=msg.result if msg.result else "",
             agent_id=agent_id,
             payload={
                 "subtype": msg.subtype.value if msg.subtype else None,
@@ -426,236 +612,22 @@ def create_message_handlers(adw_id: str, adw_step: str, agent_id: str) -> Messag
 # =============================================================================
 
 
-async def run_plan_step(
+async def run_docs_step(
     adw_id: str,
     orchestrator_agent_id: str,
-    prompt: str,
-    working_dir: str,
-    model: str = ModelName.OPUS.value,
-) -> tuple[bool, str | None, str | None]:
-    """Run the /plan step.
-
-    Args:
-        adw_id: ADW ID for logging
-        orchestrator_agent_id: Parent orchestrator agent ID
-        prompt: The task prompt to plan
-        working_dir: Working directory for the agent
-        model: Model to use
-
-    Returns:
-        Tuple of (success, session_id, agent_id)
-    """
-    step_start_time = time.time()
-
-    # Create agent record upfront (name includes ADW ID for uniqueness)
-    agent_id = await create_agent(
-        orchestrator_agent_id=orchestrator_agent_id,
-        name=f"plan-{adw_id[:8]}",
-        model=model,
-        working_dir=working_dir,
-        adw_id=adw_id,
-        adw_step=STEP_PLAN,
-    )
-    console.print(f"[dim]Created plan agent: {agent_id}[/dim]")
-
-    # System log: Agent created
-    await log_system_event(
-        adw_id=adw_id,
-        adw_step=STEP_PLAN,
-        level="INFO",
-        message=f"Created plan agent: {agent_id[:8]}",
-        metadata={"agent_id": agent_id, "model": model},
-    )
-
-    # Update agent status to executing (broadcast status change)
-    await update_agent(agent_id=agent_id, status="executing", old_status="idle")
-
-    # Log step start
-    await log_step_start(
-        adw_id=adw_id,
-        adw_step=STEP_PLAN,
-        agent_id=agent_id,
-        payload={"prompt": prompt, "model": model},
-        summary=f"Starting plan step for: {prompt[:100]}...",
-    )
-
-    # Update ADW status
-    await update_adw_status(
-        adw_id=adw_id,
-        status="in_progress",
-        current_step=STEP_PLAN,
-    )
-
-    console.print(Panel(
-        f"[bold cyan]Step 1: Plan[/bold cyan]\n\nPrompt: {prompt[:200]}...",
-        title="ADW Plan-Build Workflow",
-        width=console.width,
-    ))
-
-    try:
-        # System log: Starting agent execution
-        await log_system_event(
-            adw_id=adw_id,
-            adw_step=STEP_PLAN,
-            level="INFO",
-            message=f"Executing plan command with model {model}",
-            metadata={"prompt_preview": prompt[:100], "working_dir": working_dir},
-        )
-
-        # Build the agent query
-        # Inline the plan command content (slash commands only work when cwd is the orchestrator)
-        plan_command = load_command("plan.md", {"$1": prompt})
-        query_input = QueryInput(
-            prompt=plan_command,
-            options=QueryOptions(
-                model=model,
-                cwd=working_dir,
-                allowed_tools=[
-                    "Read", "Glob", "Grep", "Bash", "Write", "Edit",
-                    "Task", "TodoWrite", "WebFetch", "WebSearch", "Skill",
-                ],
-                hooks=create_logging_hooks(adw_id, STEP_PLAN, agent_id),
-                bypass_permissions=True,
-            ),
-            handlers=create_message_handlers(adw_id, STEP_PLAN, agent_id),
-        )
-
-        # Execute the agent
-        result = await query_to_completion(query_input)
-
-        duration_ms = int((time.time() - step_start_time) * 1000)
-
-        # Update agent with session_id and usage
-        await update_agent(
-            agent_id=agent_id,
-            session_id=result.session_id,
-            status="complete" if result.success else "blocked",
-            input_tokens=result.usage.input_tokens if result.usage else None,
-            output_tokens=result.usage.output_tokens if result.usage else None,
-            total_cost=result.usage.total_cost_usd if result.usage else None,
-        )
-
-        if result.success:
-            console.print(f"[green]Plan step completed successfully[/green]")
-            await log_step_end(
-                adw_id=adw_id,
-                adw_step=STEP_PLAN,
-                agent_id=agent_id,
-                status="success",
-                duration_ms=duration_ms,
-                payload={"session_id": result.session_id},
-                summary="Plan step completed successfully",
-            )
-            return True, result.session_id, agent_id
-        else:
-            console.print(f"[red]Plan step failed: {result.error}[/red]")
-            await log_step_end(
-                adw_id=adw_id,
-                adw_step=STEP_PLAN,
-                agent_id=agent_id,
-                status="failed",
-                duration_ms=duration_ms,
-                payload={"error": result.error},
-                summary=f"Plan step failed: {result.error}",
-            )
-            return False, None, agent_id
-
-    except Exception as e:
-        duration_ms = int((time.time() - step_start_time) * 1000)
-        console.print(f"[red]Plan step exception: {e}[/red]")
-        await update_agent(agent_id=agent_id, status="blocked", old_status="executing")
-        await log_step_end(
-            adw_id=adw_id,
-            adw_step=STEP_PLAN,
-            agent_id=agent_id,
-            status="failed",
-            duration_ms=duration_ms,
-            payload={"exception": str(e)},
-            summary=f"Plan step exception: {e}",
-        )
-        return False, None, agent_id
-
-
-async def extract_plan_path(
-    working_dir: str,
-    session_id: str | None,
-    model: str = ModelName.OPUS.value,
-) -> str | None:
-    """Use quick_prompt to extract the plan file path.
-
-    Args:
-        working_dir: Working directory
-        session_id: Session ID from plan step (for context)
-        model: Model to use
-
-    Returns:
-        Path to the plan file, or None if not found
-    """
-    console.print("[cyan]Extracting plan file path...[/cyan]")
-
-    # Very explicit prompt to get ONLY the file path
-    extraction_prompt = """You just ran /plan and created a plan file.
-
-IMPORTANT: Respond with ONLY the absolute file path to the plan file you created.
-- No explanation
-- No markdown
-- No quotes
-- Just the raw file path on a single line
-
-Example correct response:
-/Users/user/project/.ai/specs/feature-plan.md
-
-What is the absolute path to the plan file you created?"""
-
-    try:
-        result = await quick_prompt(AdhocPrompt(
-            prompt=extraction_prompt,
-            model=model,
-            cwd=working_dir,
-        ))
-
-        if result:
-            # Clean up the result - remove any whitespace, quotes, backticks
-            path = result.strip().strip("`").strip('"').strip("'").strip()
-            # Take only the first line in case there's extra text
-            path = path.split("\n")[0].strip()
-
-            # Validate it looks like a path
-            if path.startswith("/") or path.startswith("./"):
-                console.print(f"[green]Found plan file: {path}[/green]")
-                return path
-            else:
-                console.print(f"[yellow]Unexpected path format: {path}[/yellow]")
-                # Try to extract a path from the response
-                import re
-                match = re.search(r'(/[^\s]+\.md)', result)
-                if match:
-                    path = match.group(1)
-                    console.print(f"[green]Extracted path: {path}[/green]")
-                    return path
-
-        console.print("[yellow]Could not extract plan file path[/yellow]")
-        return None
-
-    except Exception as e:
-        console.print(f"[red]Error extracting plan path: {e}[/red]")
-        return None
-
-
-async def run_build_step(
-    adw_id: str,
-    orchestrator_agent_id: str,
+    user_prompt: str,
     plan_path: str,
     working_dir: str,
     model: str = ModelName.OPUS.value,
 ) -> tuple[bool, str | None, str | None]:
-    """Run the /build step.
+    """Run the /docs step.
 
     Args:
         adw_id: ADW ID for logging
         orchestrator_agent_id: Parent orchestrator agent ID
-        plan_path: Path to the plan file
-        working_dir: Working directory for the agent
+        user_prompt: The task prompt for documentation
+        plan_path: Path to the plan file (from DB)
+        working_dir: Working directory for the agent (worktree path)
         model: Model to use
 
     Returns:
@@ -663,86 +635,74 @@ async def run_build_step(
     """
     step_start_time = time.time()
 
-    # Create agent record upfront (name includes ADW ID for uniqueness)
     agent_id = await create_agent(
         orchestrator_agent_id=orchestrator_agent_id,
-        name=f"build-{adw_id[:8]}",
+        name=f"docs-{adw_id[:8]}",
         model=model,
         working_dir=working_dir,
         adw_id=adw_id,
-        adw_step=STEP_BUILD,
+        adw_step=STEP_DOCS,
     )
-    console.print(f"[dim]Created build agent: {agent_id}[/dim]")
+    console.print(f"[dim]Created docs agent: {agent_id}[/dim]")
 
-    # System log: Agent created
     await log_system_event(
         adw_id=adw_id,
-        adw_step=STEP_BUILD,
+        adw_step=STEP_DOCS,
         level="INFO",
-        message=f"Created build agent: {agent_id[:8]}",
+        message=f"Created docs agent: {agent_id[:8]}",
         metadata={"agent_id": agent_id, "model": model},
     )
 
-    # Update agent status to executing (broadcast status change)
     await update_agent(agent_id=agent_id, status="executing", old_status="idle")
 
-    # Log step start
     await log_step_start(
         adw_id=adw_id,
-        adw_step=STEP_BUILD,
+        adw_step=STEP_DOCS,
         agent_id=agent_id,
-        payload={"plan_path": plan_path, "model": model},
-        summary=f"Starting build step with plan: {plan_path}",
+        payload={"prompt": user_prompt, "plan_path": plan_path, "model": model},
+        summary=f"Starting docs step for: {user_prompt[:100]}...",
     )
 
-    # Update ADW status
     await update_adw_status(
         adw_id=adw_id,
         status="in_progress",
-        current_step=STEP_BUILD,
-        completed_steps=1,
+        current_step=STEP_DOCS,
     )
 
     console.print(Panel(
-        f"[bold cyan]Step 2: Build[/bold cyan]\n\nPlan: {plan_path}",
-        title="ADW Plan-Build Workflow",
+        f"[bold magenta]Step 1/{TOTAL_STEPS}: Docs[/bold magenta]\n\nPrompt: {user_prompt[:200]}...\nPlan: {plan_path}",
+        title="ADW Document Workflow",
         width=console.width,
     ))
 
     try:
-        # System log: Starting agent execution
         await log_system_event(
             adw_id=adw_id,
-            adw_step=STEP_BUILD,
+            adw_step=STEP_DOCS,
             level="INFO",
-            message=f"Executing build command with plan: {plan_path}",
-            metadata={"plan_path": plan_path, "working_dir": working_dir},
+            message=f"Executing docs command with model {model}",
+            metadata={"prompt_preview": user_prompt[:100], "plan_path": plan_path, "working_dir": working_dir},
         )
 
-        # Build the agent query
-        # Inline the build command content
-        build_command = load_command("build.md", {"$ARGUMENTS": plan_path})
+        docs_command = load_command("docs.md", {"$1": user_prompt, "$2": plan_path})
         query_input = QueryInput(
-            prompt=build_command,
+            prompt=docs_command,
             options=QueryOptions(
                 model=model,
                 cwd=working_dir,
                 allowed_tools=[
-                    "Read", "Glob", "Grep", "Bash", "Write", "Edit",
-                    "Task", "TodoWrite", "WebFetch", "WebSearch", "Skill",
+                    "Read", "Glob", "Grep", "Bash", "Write", "Edit", "Skill",
                 ],
-                hooks=create_logging_hooks(adw_id, STEP_BUILD, agent_id),
+                hooks=create_logging_hooks(adw_id, STEP_DOCS, agent_id),
                 bypass_permissions=True,
             ),
-            handlers=create_message_handlers(adw_id, STEP_BUILD, agent_id),
+            handlers=create_message_handlers(adw_id, STEP_DOCS, agent_id),
         )
 
-        # Execute the agent
         result = await query_to_completion(query_input)
 
         duration_ms = int((time.time() - step_start_time) * 1000)
 
-        # Update agent with session_id and usage
         await update_agent(
             agent_id=agent_id,
             session_id=result.session_id,
@@ -753,42 +713,42 @@ async def run_build_step(
         )
 
         if result.success:
-            console.print(f"[green]Build step completed successfully[/green]")
+            console.print(f"[green]Docs step completed successfully[/green]")
             await log_step_end(
                 adw_id=adw_id,
-                adw_step=STEP_BUILD,
+                adw_step=STEP_DOCS,
                 agent_id=agent_id,
                 status="success",
                 duration_ms=duration_ms,
                 payload={"session_id": result.session_id},
-                summary="Build step completed successfully",
+                summary="Docs step completed successfully",
             )
             return True, result.session_id, agent_id
         else:
-            console.print(f"[red]Build step failed: {result.error}[/red]")
+            console.print(f"[red]Docs step failed: {result.error}[/red]")
             await log_step_end(
                 adw_id=adw_id,
-                adw_step=STEP_BUILD,
+                adw_step=STEP_DOCS,
                 agent_id=agent_id,
                 status="failed",
                 duration_ms=duration_ms,
                 payload={"error": result.error},
-                summary=f"Build step failed: {result.error}",
+                summary=f"Docs step failed: {result.error}",
             )
             return False, None, agent_id
 
     except Exception as e:
         duration_ms = int((time.time() - step_start_time) * 1000)
-        console.print(f"[red]Build step exception: {e}[/red]")
+        console.print(f"[red]Docs step exception: {e}[/red]")
         await update_agent(agent_id=agent_id, status="blocked", old_status="executing")
         await log_step_end(
             adw_id=adw_id,
-            adw_step=STEP_BUILD,
+            adw_step=STEP_DOCS,
             agent_id=agent_id,
             status="failed",
             duration_ms=duration_ms,
             payload={"exception": str(e)},
-            summary=f"Build step exception: {e}",
+            summary=f"Docs step exception: {e}",
         )
         return False, None, agent_id
 
@@ -799,7 +759,7 @@ async def run_build_step(
 
 
 async def run_workflow(adw_id: str) -> bool:
-    """Run the complete plan-build workflow.
+    """Run the docs workflow with worktree isolation and auto-PR.
 
     Args:
         adw_id: The ADW ID to execute
@@ -809,23 +769,19 @@ async def run_workflow(adw_id: str) -> bool:
     """
     workflow_start_time = time.time()
 
-    # Initialize logging with WebSocket connection for real-time updates
-    # This is resilient - workflow continues even if WS server is unavailable
     await init_logging(verbose=False)
 
     console.print(Panel(
-        f"[bold]Starting ADW Plan-Build Workflow[/bold]\n\nADW ID: {adw_id}",
+        f"[bold]Starting ADW Document Workflow[/bold]\n\nADW ID: {adw_id}",
         title="ADW Workflow",
         width=console.width,
     ))
 
-    # Fetch ADW record from database
     adw = await get_adw(adw_id)
     if not adw:
         console.print(f"[red]ADW not found: {adw_id}[/red]")
         return False
 
-    # Extract orchestrator_agent_id (required for creating child agents)
     orchestrator_agent_id = adw.get("orchestrator_agent_id")
     if not orchestrator_agent_id:
         console.print("[red]No orchestrator_agent_id found in ADW record[/red]")
@@ -837,11 +793,12 @@ async def run_workflow(adw_id: str) -> bool:
         return False
     orchestrator_agent_id = str(orchestrator_agent_id)
 
-    # Extract input data
     input_data = adw.get("input_data", {})
     prompt = input_data.get("prompt")
     working_dir = input_data.get("working_dir")
     model = input_data.get("model", ModelName.OPUS.value)
+    plan_path = input_data.get("plan_path")
+    docs_model = input_data.get("docs_model", model)
 
     if not prompt:
         console.print("[red]No prompt found in ADW input_data[/red]")
@@ -861,85 +818,95 @@ async def run_workflow(adw_id: str) -> bool:
         )
         return False
 
+    if not plan_path:
+        console.print("[red]No plan_path found in ADW input_data[/red]")
+        await update_adw_status(
+            adw_id=adw_id,
+            status="failed",
+            error_message="No plan_path found in input_data",
+        )
+        return False
+
     console.print(f"[cyan]Prompt:[/cyan] {prompt[:200]}...")
     console.print(f"[cyan]Working Dir:[/cyan] {working_dir}")
-    console.print(f"[cyan]Model:[/cyan] {model}")
+    console.print(f"[cyan]Plan Path:[/cyan] {plan_path}")
+    console.print(f"[cyan]Model:[/cyan] {docs_model}")
 
-    # Log workflow start
     await log_system_event(
         adw_id=adw_id,
         adw_step=None,
         level="INFO",
         message=f"Workflow started: {adw.get('adw_name', 'unknown')}",
-        metadata={"prompt": prompt, "working_dir": working_dir, "model": model},
+        metadata={
+            "prompt": prompt,
+            "working_dir": working_dir,
+            "plan_path": plan_path,
+            "model": docs_model,
+            "total_steps": TOTAL_STEPS,
+        },
     )
 
     try:
-        # Step 1: Plan
-        plan_success, plan_session_id, plan_agent_id = await run_plan_step(
-            adw_id=adw_id,
-            orchestrator_agent_id=orchestrator_agent_id,
-            prompt=prompt,
-            working_dir=working_dir,
-            model=model,
-        )
-
-        if not plan_success:
+        # =================================================================
+        # Create worktree in target repo
+        # =================================================================
+        try:
+            worktree_path, branch_name = create_worktree_in_target(
+                working_dir=working_dir,
+                adw_id=adw_id,
+            )
+        except RuntimeError as e:
+            console.print(f"[red]Worktree creation failed: {e}[/red]")
             await update_adw_status(
                 adw_id=adw_id,
                 status="failed",
-                error_message="Plan step failed",
-                error_step=STEP_PLAN,
+                error_message=f"Worktree creation failed: {e}",
             )
             return False
 
-        # Extract plan file path
-        plan_path = await extract_plan_path(
-            working_dir=working_dir,
-            session_id=plan_session_id,
-            model=model,
+        await log_system_event(
+            adw_id=adw_id,
+            adw_step=None,
+            level="INFO",
+            message=f"Created worktree: {worktree_path} (branch: {branch_name})",
         )
 
-        if not plan_path:
-            # Try a fallback - look for recently created .md files in .ai/specs/
-            console.print("[yellow]Attempting fallback plan path detection...[/yellow]")
-            specs_dir = Path(working_dir) / ".ai" / "specs"
-            if specs_dir.exists():
-                md_files = sorted(specs_dir.glob("*.md"), key=lambda f: f.stat().st_mtime, reverse=True)
-                if md_files:
-                    plan_path = str(md_files[0])
-                    console.print(f"[green]Found recent plan file: {plan_path}[/green]")
-
-        if not plan_path:
-            await update_adw_status(
-                adw_id=adw_id,
-                status="failed",
-                error_message="Could not extract plan file path",
-                error_step=STEP_PLAN,
-            )
-            return False
-
-        # Step 2: Build
-        build_success, build_session_id, build_agent_id = await run_build_step(
+        # =================================================================
+        # Step 1: Docs (runs inside worktree)
+        # =================================================================
+        docs_success, docs_session_id, docs_agent_id = await run_docs_step(
             adw_id=adw_id,
             orchestrator_agent_id=orchestrator_agent_id,
+            user_prompt=prompt,
             plan_path=plan_path,
-            working_dir=working_dir,
-            model=model,
+            working_dir=worktree_path,
+            model=docs_model,
         )
 
-        if not build_success:
+        if not docs_success:
             await update_adw_status(
                 adw_id=adw_id,
                 status="failed",
-                error_message="Build step failed",
-                error_step=STEP_BUILD,
-                completed_steps=1,
+                error_message="Docs step failed",
+                error_step=STEP_DOCS,
             )
             return False
 
-        # Workflow completed successfully
+        # =================================================================
+        # Push and create PR
+        # =================================================================
+        pr_url = await push_and_create_pr(
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            adw_id=adw_id,
+            prompt=prompt,
+        )
+
+        # =================================================================
+        # Workflow Completed
+        # =================================================================
         duration_seconds = int(time.time() - workflow_start_time)
+
         await update_adw_status(
             adw_id=adw_id,
             status="completed",
@@ -950,22 +917,26 @@ async def run_workflow(adw_id: str) -> bool:
             adw_id=adw_id,
             adw_step=None,
             level="INFO",
-            message=f"Workflow completed successfully in {duration_seconds}s",
+            message=f"Workflow completed in {duration_seconds}s",
             metadata={
                 "plan_path": plan_path,
-                "plan_session_id": plan_session_id,
-                "plan_agent_id": plan_agent_id,
-                "build_session_id": build_session_id,
-                "build_agent_id": build_agent_id,
+                "docs_session_id": docs_session_id,
+                "docs_agent_id": docs_agent_id,
+                "pr_url": pr_url,
+                "worktree_path": worktree_path,
+                "branch_name": branch_name,
                 "duration_seconds": duration_seconds,
             },
         )
 
         console.print(Panel(
-            f"[bold green]Workflow Completed Successfully![/bold green]\n\n"
+            f"[bold green]Document Workflow Completed![/bold green]\n\n"
             f"Duration: {duration_seconds}s\n"
-            f"Plan file: {plan_path}",
-            title="ADW Complete",
+            f"Plan file: {plan_path}\n"
+            f"Worktree: {worktree_path}\n"
+            f"Branch: {branch_name}\n"
+            f"PR: {pr_url or 'N/A'}",
+            title="ADW Document Complete",
             width=console.width,
         ))
 
@@ -987,7 +958,6 @@ async def run_workflow(adw_id: str) -> bool:
         return False
 
     finally:
-        # Always close logging (database pool + WebSocket connection)
         await close_logging()
 
 
@@ -997,9 +967,9 @@ async def run_workflow(adw_id: str) -> bool:
 
 
 def main():
-    """CLI entrypoint for the plan-build workflow."""
+    """CLI entrypoint for the document workflow."""
     parser = argparse.ArgumentParser(
-        description="ADW Plan-Build Workflow",
+        description="ADW Document Workflow - Standalone docs with worktree isolation and auto-PR",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -1010,7 +980,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Run the workflow
     success = asyncio.run(run_workflow(args.adw_id))
 
     sys.exit(0 if success else 1)

@@ -3,7 +3,7 @@
 Execute the `Run`, `Read` and `Report` sections to understand the codebase then summarize your understanding.
 
 ## Focus
-- Primary focus: `apps/orchestrator_3_stream/*`
+- Primary focus: CLI-driven multi-agent orchestration (commands, agents, ADW workflows)
 
 ## Run
 git ls-files
@@ -12,23 +12,20 @@ git ls-files
 
 ### Core (always read these):
 - @README.md
-- @apps/orchestrator_db/README.md
-- @apps/orchestrator_db/models.py
-- @apps/orchestrator_3_stream/README.md
-- apps/orchestrator_3_stream/frontend/src/types.d.ts
-- apps/orchestrator_3_stream/backend/modules/orch_database_models.py
+- @CLAUDE.md
+- @.env.sample
 
-### Backend (if working on backend):
-- apps/orchestrator_3_stream/backend/main.py
-- apps/orchestrator_3_stream/backend/modules/orchestrator_service.py
-- apps/orchestrator_3_stream/backend/modules/websocket_manager.py
+### Commands & Agents:
+- .claude/commands/plan.md
+- .claude/commands/build.md
+- .claude/commands/review.md
+- .claude/commands/fix.md
+- .claude/agents/scout-report-suggest.md
+- .claude/agents/build-agent.md
 
-### Frontend (if working on frontend):
-- apps/orchestrator_3_stream/frontend/src/stores/orchestratorStore.ts
-- apps/orchestrator_3_stream/frontend/src/services/chatService.ts
-- apps/orchestrator_3_stream/frontend/src/components/OrchestratorChat.vue
-- apps/orchestrator_3_stream/frontend/src/components/EventStream.vue
-- apps/orchestrator_3_stream/frontend/src/components/AgentList.vue
+### ADW Workflows:
+- adws/adw_workflows/adw_plan_build.py
+- adws/adw_triggers/adw_manual_trigger.py
 
 ## Report
 Summarize your understanding of the codebase.

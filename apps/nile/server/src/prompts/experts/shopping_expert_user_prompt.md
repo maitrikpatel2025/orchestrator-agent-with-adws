@@ -1,1 +1,0 @@
-Generate a personalized home page for this user.
